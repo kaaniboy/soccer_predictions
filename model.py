@@ -13,12 +13,14 @@ SCHALKE_ID = 10189
 PSG_ID = 9847
 
 LEARNING_RATE = .8
-BATCH_SIZE = 120
+TEST_SIZE = 0.2
+BATCH_SIZE = 150
 NUM_EPOCHS = 800
 NUM_TASKS = 3
 
 NUM_FEATURES = 8
 HIDDEN_NEURONS = 8
+NUM_OUTPUTS = 3 # Win, Tie, and Loss
 
 conn = sqlite3.connect("../soccer.sqlite")
 
@@ -71,26 +73,17 @@ def get_team_training_data(team_id, conn, cleaned=False):
         M.away_team_api_id = %s
     """ % (team_id)
 
-    def populate_win(match):
-        if match['own_goal'] == match['opponent_goal']:
-            return 0.5 # Tie
-        elif match['own_goal'] > match['opponent_goal']:
-            return 1
-        else:
-            return 0
-
     home_matches = pd.read_sql_query(home_query, conn)
     away_matches = pd.read_sql_query(away_query, conn)
     
     frames = [home_matches, away_matches]
 
     combined = pd.concat(frames)
-
-    # For now, remove all matches that ended in a tie.
-    combined = combined[combined['opponent_goal'] != combined['own_goal']]
     
     labels = pd.DataFrame()
-    labels['win'] = combined.apply(lambda match: populate_win(match), axis=1)
+    labels['win'] = np.where(combined['own_goal'] > combined['opponent_goal'], 1, 0)
+    labels['tie'] = np.where(combined['own_goal'] == combined['opponent_goal'], 1, 0)
+    labels['loss'] = np.where(combined['own_goal'] < combined['opponent_goal'], 1, 0)
 
     if cleaned:
         combined.drop(['opponent_goal', 'own_goal', 'date', 'opponent_name'], axis=1, inplace=True)
@@ -123,24 +116,24 @@ psg = scaler.transform(psg)
 
 # Split the data into training sets and test sets.
 
-liverpool_train, liverpool_test, liverpool_train_labels, liverpool_test_labels = train_test_split(liverpool, liverpool_labels, test_size=0.2)
-schalke_train, schalke_test, schalke_train_labels, schalke_test_labels = train_test_split(schalke, schalke_labels, test_size=0.2)
-psg_train, psg_test, psg_train_labels, psg_test_labels = train_test_split(psg, psg_labels, test_size=0.2)
+liverpool_train, liverpool_test, liverpool_train_labels, liverpool_test_labels = train_test_split(liverpool, liverpool_labels, test_size=TEST_SIZE)
+schalke_train, schalke_test, schalke_train_labels, schalke_test_labels = train_test_split(schalke, schalke_labels, test_size=TEST_SIZE)
+psg_train, psg_test, psg_train_labels, psg_test_labels = train_test_split(psg, psg_labels, test_size=TEST_SIZE)
 
-# Placeholders for inputs to the neural network.
+# Placeholders for inputs and expected outputs of the neural network.
 
 X = tf.placeholder(tf.float32, [None, NUM_FEATURES], name="X")
 
-T1 = tf.placeholder(tf.float32, [None, 1], name="T1_labels")
-T2 = tf.placeholder(tf.float32, [None, 1], name="T2_labels")
-T3 = tf.placeholder(tf.float32, [None, 1], name="T3_labels")
+T1 = tf.placeholder(tf.float32, [None, NUM_OUTPUTS], name="T1_labels")
+T2 = tf.placeholder(tf.float32, [None, NUM_OUTPUTS], name="T2_labels")
+T3 = tf.placeholder(tf.float32, [None, NUM_OUTPUTS], name="T3_labels")
 
 # Weights for the various layers of the neural network.
 
 initial_shared_weights = np.random.rand(NUM_FEATURES, HIDDEN_NEURONS)
-initial_T1_weights = np.random.rand(HIDDEN_NEURONS, 1)
-initial_T2_weights = np.random.rand(HIDDEN_NEURONS, 1)
-initial_T3_weights = np.random.rand(HIDDEN_NEURONS, 1)
+initial_T1_weights = np.random.rand(HIDDEN_NEURONS, NUM_OUTPUTS)
+initial_T2_weights = np.random.rand(HIDDEN_NEURONS, NUM_OUTPUTS)
+initial_T3_weights = np.random.rand(HIDDEN_NEURONS, NUM_OUTPUTS)
 
 shared_weights = tf.Variable(initial_shared_weights, dtype=tf.float32, name="shared_weights")
 T1_weights = tf.Variable(initial_T1_weights, dtype=tf.float32, name="T1_weights")
@@ -155,10 +148,10 @@ T2_layer = tf.matmul(shared_layer, T2_weights)
 T3_layer = tf.matmul(shared_layer, T3_weights)
 
 # Define loss functions and optimizers for each of the tasks.
-# Sigmoid activation on outputs because we want to perform classification.
-T1_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=T1, logits=T1_layer))
-T2_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=T2, logits=T2_layer))
-T3_loss = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(labels=T3, logits=T3_layer))
+# Softmax activation on outputs because we want to perform multi-class, mutually exclusive classification.
+T1_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=T1, logits=T1_layer))
+T2_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=T2, logits=T2_layer))
+T3_loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(labels=T3, logits=T3_layer))
 
 T1_op = tf.train.AdamOptimizer().minimize(T1_loss)
 T2_op = tf.train.AdamOptimizer().minimize(T2_loss)
@@ -178,15 +171,15 @@ for epoch in range(NUM_EPOCHS):
     
     liverpool_batch, liverpool_batch_labels = get_mini_batch(liverpool_train, liverpool_train_labels, BATCH_SIZE)
     
-    _, t1, T1_output = sess.run([T1_op, T1_loss, tf.nn.sigmoid(T1_layer)], {X: liverpool_batch, T1: liverpool_batch_labels})
+    _, t1, T1_output = sess.run([T1_op, T1_loss, tf.nn.softmax(T1_layer)], {X: liverpool_batch, T1: liverpool_batch_labels})
     
     schalke_batch, schalke_batch_labels = get_mini_batch(schalke_train, schalke_train_labels, BATCH_SIZE)
     
-    _, t2, T2_output = sess.run([T2_op, T2_loss, tf.nn.sigmoid(T2_layer)], {X: schalke_batch, T2: schalke_batch_labels})
+    _, t2, T2_output = sess.run([T2_op, T2_loss, tf.nn.softmax(T2_layer)], {X: schalke_batch, T2: schalke_batch_labels})
     
     psg_batch, psg_batch_labels = get_mini_batch(psg_train, psg_train_labels, BATCH_SIZE)
     
-    _, t3, T3_output = sess.run([T3_op, T3_loss, tf.nn.sigmoid(T3_layer)], {X: psg_batch, T3: psg_batch_labels})
+    _, t3, T3_output = sess.run([T3_op, T3_loss, tf.nn.softmax(T3_layer)], {X: psg_batch, T3: psg_batch_labels})
 
     T1_errors.append(t1)
     T2_errors.append(t2)
@@ -206,13 +199,14 @@ plt.show()
 
 # Validate the model on the test data.
 
-T1_output = sess.run(tf.nn.sigmoid(T1_layer), {X: liverpool_test})
-T2_output = sess.run(tf.nn.sigmoid(T2_layer), {X: schalke_test})
-T3_output = sess.run(tf.nn.sigmoid(T3_layer), {X: psg_test})
+T1_output = sess.run(tf.nn.softmax(T1_layer), {X: liverpool_test})
+T2_output = sess.run(tf.nn.softmax(T2_layer), {X: schalke_test})
+T3_output = sess.run(tf.nn.softmax(T3_layer), {X: psg_test})
 
-T1_output = np.where(T1_output >= 0.5, 1, 0)
-T2_output = np.where(T2_output >= 0.5, 1, 0)
-T3_output = np.where(T3_output >= 0.5, 1, 0)
+# Discretize the outputs so that the outcome is either Win, Tie, or Loss.
+T1_output = (T1_output == T1_output.max(axis=1)[:,None]).astype(int)
+T2_output = (T2_output == T2_output.max(axis=1)[:,None]).astype(int)
+T3_output = (T3_output == T3_output.max(axis=1)[:,None]).astype(int)
 
 T1_accuracy = accuracy_score(T1_output, liverpool_test_labels)
 T2_accuracy = accuracy_score(T2_output, schalke_test_labels)
